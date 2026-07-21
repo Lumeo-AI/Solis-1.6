@@ -1,0 +1,6 @@
+.venv/
+__pycache__/
+*.pyc
+checkpoints/
+data/corpus.jsonl
+.DS_Store
