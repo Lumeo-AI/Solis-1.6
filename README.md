@@ -1,42 +1,129 @@
-# Zeus ⚡
+# Solis ☀️
 
-A **Mixture-of-Experts (MoE)** language model built entirely from scratch — no
-base model, no pretrained weights, no external vocabulary. Zeus reads and writes
-raw bytes and routes every token through a sparse set of expert networks.
+A **sparse Mixture-of-Experts** language model built entirely from scratch — no
+base model, no pretrained weights, no borrowed vocabulary. Solis learns its own
+tokenizer, its own experts, and its own router, starting from random numbers.
+
+The 1.0 family is designed against one hard constraint: **every preset must
+serve inside 16 GB of VRAM**, weights, KV cache, and activation workspace
+included, while keeping *active* parameters low so decoding stays fast.
+
+```
+preset      total   active    ctx   weights     kv    act    peak   fits 16GB
+------------------------------------------------------------------------------
+mini         335M     123M   2048     0.62G  0.03G  0.07G   1.62G        yes
+small       1.79B     489M   4096     3.33G  0.09G  0.22G   4.55G        yes
+base        4.48B     974M   8192     8.35G  0.22G  0.63G  10.09G        yes
+flagship    6.33B    1.40B   8192    11.80G  0.47G  0.72G  13.88G        yes
+```
+
+`python -m solis.config` prints this table; `python bench.py` measures it for
+real and tells you where the estimate is wrong.
 
 ## Architecture
 
-Decoder-only transformer (`zeus/model.py`):
+Decoder-only transformer (`solis/model.py`):
 
-- **Byte-level tokenizer** (`zeus/tokenizer.py`) — 256 byte tokens + a few
-  special tokens for chat structure (`<BOS>`, `<EOS>`, `<USER>`, `<ASST>`).
-- **RMSNorm** pre-normalization.
-- **Rotary positional embeddings (RoPE)**.
-- **Causal multi-head self-attention** (via `scaled_dot_product_attention`).
-- **Mixture-of-Experts FFN**: a learned router picks the **top-2 of 8** SwiGLU
-  experts per token, with a **load-balancing auxiliary loss** and a **router
-  z-loss** for stable training.
-- Weight-tied embedding / LM head.
+- **Byte-level BPE tokenizer** (`solis/tokenizer.py`) trained on our own corpus.
+  256 byte tokens are always present as a fallback, so nothing is ever
+  unencodable, and round-tripping is exact for arbitrary bytes.
+- **RMSNorm** pre-normalisation, computed in fp32 regardless of autocast dtype.
+- **Grouped-query attention** — fewer KV heads than query heads, which is what
+  makes the KV cache small enough to serve long context in 16 GB.
+- **QK-norm** — RMSNorm on queries and keys before the dot product. Removes the
+  attention-logit blowup that otherwise makes small models diverge.
+- **Sliding-window attention** on most layers, with every 4th layer left global,
+  so attention cost grows linearly in context but information still travels the
+  full sequence.
+- **Rotary position embeddings**, with a scaling factor for serving beyond the
+  trained context.
+- **Mixture-of-Experts FFN** — one *shared* expert that runs for every token,
+  plus a top-k routed set of specialists. The shared path is what keeps a sparse
+  model coherent at small scale: general-purpose computation lives there instead
+  of being relearned by every expert.
+- **Aux-loss-free load balancing** — a per-expert bias steers routing toward
+  under-used experts without adding gradient noise, backed by a small classic
+  auxiliary loss and a router z-loss.
+- The first layers stay **dense**; early layers do broad low-level work that
+  every token needs, so routing them wastes capacity.
+- Weight-tied embedding / LM head, and residual branches scaled by `1/sqrt(2L)`
+  at init so the residual stream does not grow with depth.
 
-Default config (`zeus/config.py`): dim 384, 6 layers, 6 heads, 8 experts,
-top-2 routing, 512-token context — about 46M total parameters (only a fraction
-active per token thanks to sparse routing).
+### Two implementation details that are easy to get wrong
+
+**MoE dispatch runs as three batched matmuls**, not a Python loop over experts.
+Tokens are sorted by expert and packed into a fixed `(n_experts, capacity, dim)`
+buffer. The naive version — slicing the token stream per expert and looping —
+issues `3 x n_experts` small GEMMs per layer *and* needs a host synchronisation
+to learn the slice boundaries.
+
+**Capacity limiting is training-only.** During training a fixed capacity keeps
+every tensor shape static; overflow pairs are routed to a scratch row whose
+output is zeroed, so they contribute nothing. At inference capacity is the
+largest actual group, which costs one device-to-host read per layer but
+guarantees a token's output never depends on which other tokens shared its
+batch. Without that split, a prefill disagrees with the same tokens decoded one
+at a time — `tests/test_model.py` checks exactly this.
 
 ## Quickstart
 
 ```bash
-python3 -m venv .venv && source .venv/bin/activate
+python -m venv .venv && .venv/Scripts/activate   # Linux/macOS: source .venv/bin/activate
 pip install -r requirements.txt
 
-python data/build_corpus.py   # generate the synthetic chat corpus
-python train.py               # train from scratch -> checkpoints/zeus.pt
-uvicorn serve:app --port 8000 # serve the chat endpoint
+python data/build_corpus.py      # 1. generate the corpus
+python data/train_tokenizer.py   # 2. learn the BPE vocabulary
+python data/prepare.py           # 3. tokenise + pack to .bin
+python train.py                  # 4. train  -> checkpoints/solis-mini.pt
+
+python eval.py                   # task accuracy + validation perplexity
+python bench.py                  # real VRAM and throughput
+uvicorn serve:app --port 8000    # serve
 ```
 
-> The bundled corpus is small and synthetic, so Zeus is a real but *tiny* model:
-> it learns the chat format and its training data, not general knowledge. Training
-> takes a few minutes on Apple-silicon (MPS) or CPU. Scale up `data/build_corpus.py`,
-> `ZeusConfig`, and the step count in `train.py` for a bigger model.
+Run the tests with `python tests/test_model.py`.
+
+## Training
+
+`train.py` uses fp32 master weights with bf16 autocast, gradient accumulation,
+gradient checkpointing (on by default — a top-k MoE stores `k` copies of every
+intermediate, so recomputation is worth much more here than in a dense model),
+cosine decay after warmup, and no weight decay on norms or embeddings.
+
+The micro-batch is chosen automatically from free VRAM, and an OOM anywhere in
+the step halves it and retries rather than losing the run.
+
+```bash
+python train.py --preset mini --max-minutes 90
+python train.py --resume
+python train.py --preset small --adam8bit    # 8-bit optimizer states
+```
+
+`mini` and `small` train on a single 16 GB card. `base` and `flagship` are
+inference-only at that size — training them needs roughly 55 GB and 77 GB of
+optimizer state respectively, which is a multi-GPU or offloaded job.
+
+## The corpus
+
+Everything in `data/build_corpus.py` is generated procedurally. Nothing is
+scraped and nothing is copyrighted, which keeps the from-scratch claim true end
+to end.
+
+The generator is weighted deliberately. A model this size cannot store facts
+about the world, so teaching it trivia wastes capacity. What it *can* learn is
+**in-context work**: answer from the passage you were given, transform this
+text, follow this format, carry state across turns. Roughly two thirds of the
+corpus is tasks of that shape, where the answer is derivable from the prompt
+rather than recalled — including questions the passage deliberately does not
+answer, so that "the passage doesn't say" is a trained response rather than an
+accident.
+
+**This is also the model's main limitation.** A procedural corpus has bounded
+lexical diversity: BPE training saturates at ~5k merges because there are only
+~5k unique pre-tokens in it. Solis is genuinely good at the task shapes it was
+trained on and will not have broad world knowledge. Pointing the pipeline at a
+large natural-language corpus is the single highest-leverage change available —
+`data/prepare.py` accepts any JSONL with a `messages` field.
 
 ## Serving API
 
@@ -51,13 +138,23 @@ uvicorn serve:app --port 8000 # serve the chat endpoint
 data: {"type":"token","text":"I"}
 data: {"type":"token","text":" am"}
 ...
-data: {"type":"done","usage":{"prompt_tokens":18,"completion_tokens":42,"total_tokens":60}}
+data: {"type":"done","usage":{...},"timing":{"tokens_per_second":42.1}}
 ```
 
-`GET /health` — device, checkpoint status, parameter count.
+`POST /v1/chat/completions` — OpenAI-compatible, streaming or not, so existing
+clients work unchanged.
 
-## The website
+`GET /health` — device, dtype, parameter counts, live VRAM.
 
-The companion chat UI lives in [`../zeuswebsite`](../zeuswebsite). It points at
-this server via the `ZEUS_ENDPOINT` environment variable and enforces a
-100k-tokens-per-week-per-user limit behind Clerk authentication.
+Streaming is byte-aware: a BPE token can end mid-UTF-8-character, so partial
+bytes are held back until they form a complete character.
+
+Environment: `SOLIS_CKPT`, `SOLIS_TOKENIZER`, `SOLIS_DEVICE`, `SOLIS_DTYPE`,
+`SOLIS_MAX_TOKENS`, `SOLIS_CORS_ORIGINS`, `PORT`.
+
+## Website
+
+`website/` holds the generated content bundle — `model-card.json`,
+`specs.json`, and copy blocks — regenerated from measured results by
+`python website/build_site_data.py`. Every Solis number there is measured on
+the machine that produced it; any third-party figure is labelled as such.
