@@ -8,4 +8,4 @@ pydantic>=2.0
 
 # Optional: --adam8bit keeps optimizer states in 8 bits, which is what makes
 # the `small` preset trainable on a 16 GB card. Training works without it.
-# bitsandbytes>=0.43
+bitsandbytes>=0.43
