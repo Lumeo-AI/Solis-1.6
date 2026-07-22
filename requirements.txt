@@ -1,3 +1,11 @@
+# Core. Everything Solis needs to train and serve.
 torch>=2.2
+numpy>=1.24
+regex>=2023.0        # BPE pre-tokenisation needs \p{L} character classes
 fastapi>=0.110
 uvicorn[standard]>=0.29
+pydantic>=2.0
+
+# Optional: --adam8bit keeps optimizer states in 8 bits, which is what makes
+# the `small` preset trainable on a 16 GB card. Training works without it.
+# bitsandbytes>=0.43

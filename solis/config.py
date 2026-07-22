@@ -78,6 +78,12 @@ class SolisConfig:
     # --- attention details -------------------------------------------------
     qk_norm: bool = True             # RMSNorm on q and k; major stability win
     attn_logit_softcap: float = 0.0  # 0 disables; >0 caps logits at +/- value
+    # Sliding-window attention trades a little quality for attention cost that
+    # grows linearly rather than quadratically in context. It is not free in
+    # PyTorch: an explicit mask drops `scaled_dot_product_attention` off its
+    # fused flash kernel onto the slower memory-efficient one, measured here at
+    # about a 10% end-to-end penalty. That is a clear loss at short context and
+    # a clear win at long context, so the short-context preset leaves it off.
     sliding_window: int = 0          # 0 = full attention on every layer
     sliding_window_pattern: int = 0  # every Nth layer is full attention
 
@@ -306,7 +312,9 @@ PRESETS: dict[str, SolisConfig] = {
         max_seq_len=2048,
         n_experts=16, n_experts_per_tok=4, n_shared_experts=1,
         expert_hidden=512, dense_layers=1, dense_hidden=2048,
-        sliding_window=1024, sliding_window_pattern=4,
+        # Full attention: at 2048 tokens a 1024 window saves little and costs
+        # the flash kernel. See the note on `sliding_window` above.
+        sliding_window=0, sliding_window_pattern=0,
     ),
     # Fine-tunable with LoRA / 8-bit optimizers on 16 GB.
     "small": SolisConfig(

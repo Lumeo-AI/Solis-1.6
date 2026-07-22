@@ -372,7 +372,7 @@ def main():
                         _, out = model(x, targets=y)
                     loss, ce, aux = out
                     (loss / accum).backward()
-                    step_loss += float(loss) / accum
+                    step_loss += float(loss.detach()) / accum
                     step_ce += float(ce) / accum
                     step_aux += float(aux) / accum
                 break

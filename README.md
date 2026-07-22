@@ -152,9 +152,10 @@ bytes are held back until they form a complete character.
 Environment: `SOLIS_CKPT`, `SOLIS_TOKENIZER`, `SOLIS_DEVICE`, `SOLIS_DTYPE`,
 `SOLIS_MAX_TOKENS`, `SOLIS_CORS_ORIGINS`, `PORT`.
 
-## Website
+## Website data
 
-`website/` holds the generated content bundle — `model-card.json`,
-`specs.json`, and copy blocks — regenerated from measured results by
-`python website/build_site_data.py`. Every Solis number there is measured on
-the machine that produced it; any third-party figure is labelled as such.
+The companion site lives on a separate machine, not in this repo. The numbers
+it needs come from the measurement scripts here: `python eval.py` writes
+`results/eval.json` (task accuracy, validation perplexity) and `python bench.py`
+writes `results/bench.json` (real VRAM and throughput per preset). Every Solis
+number in those files is measured on the machine that produced it.
