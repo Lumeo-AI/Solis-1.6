@@ -32,7 +32,8 @@ import time
 import uuid
 from pathlib import Path
 from queue import Queue
-from typing import List, Literal, Optional
+from dataclasses import dataclass
+from typing import List, Literal, Optional, Union
 
 import torch
 from fastapi import FastAPI, HTTPException
@@ -41,8 +42,15 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from solis.config import SolisConfig, get_config
-from solis.model import Solis, generate_stream
+from solis.model import generate_stream
+from solis.multimodal import SolisMM, DEFAULT_VISION, DEFAULT_AUDIO
+from solis import preprocess
 from solis.tokenizer import SolisTokenizer, EOS
+
+
+def _envflag(name: str) -> bool:
+    return os.environ.get(name, "").lower() in ("1", "true", "yes", "on")
+
 
 ROOT = Path(__file__).resolve().parent
 CKPT = Path(os.environ.get("SOLIS_CKPT",
@@ -50,6 +58,12 @@ CKPT = Path(os.environ.get("SOLIS_CKPT",
 TOKENIZER = Path(os.environ.get("SOLIS_TOKENIZER",
                                 ROOT / "checkpoints" / "tokenizer.json"))
 MAX_TOKENS = int(os.environ.get("SOLIS_MAX_TOKENS", "1024"))
+# Media acceptance. A checkpoint that carries trained encoders turns these on
+# automatically; the env vars force them on for a text-only checkpoint, which
+# lets the endpoint accept images/audio even though untrained encoders cannot
+# yet interpret them (/health flags this as encoders_trained: false).
+ENABLE_VISION = _envflag("SOLIS_ENABLE_VISION")
+ENABLE_AUDIO = _envflag("SOLIS_ENABLE_AUDIO")
 
 _DTYPES = {"bfloat16": torch.bfloat16, "float16": torch.float16,
            "float32": torch.float32}
@@ -70,18 +84,20 @@ DEVICE = _pick_device()
 DTYPE = _DTYPES[os.environ.get(
     "SOLIS_DTYPE", "bfloat16" if DEVICE == "cuda" else "float32")]
 
-app = FastAPI(title="Solis", version="1.0.0",
-              description="Sparse mixture-of-experts language model")
+app = FastAPI(title="Solis", version="1.1.0",
+              description="Sparse mixture-of-experts language model "
+                          "with image and voice input")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=os.environ.get("SOLIS_CORS_ORIGINS", "*").split(","),
     allow_methods=["*"], allow_headers=["*"],
 )
 
-_model: Optional[Solis] = None
+_model: Optional[SolisMM] = None
 _tok: Optional[SolisTokenizer] = None
 _cfg: Optional[SolisConfig] = None
 _loaded_from = "uninitialised"
+_encoders_trained = False
 # One model, one CUDA stream: generation is serialised. Batching concurrent
 # requests would need a paged KV cache, which is out of scope for this server.
 _lock = threading.Lock()
@@ -99,27 +115,47 @@ def get_tokenizer() -> SolisTokenizer:
     return _tok
 
 
-def get_model() -> Solis:
-    global _model, _cfg, _loaded_from
+def get_model() -> SolisMM:
+    global _model, _cfg, _loaded_from, _encoders_trained
     if _model is not None:
         return _model
+
     if CKPT.exists():
         blob = torch.load(CKPT, map_location="cpu", weights_only=False)
         cfg = SolisConfig.from_dict(blob["config"])
-        model = Solis(cfg)
-        model.load_state_dict(blob["model"])
+        vision_cfg, audio_cfg = SolisMM.config_from_dict(blob.get("modality"))
+        # Env flags can add encoders to a text-only checkpoint.
+        if vision_cfg is None and ENABLE_VISION:
+            vision_cfg = DEFAULT_VISION
+        if audio_cfg is None and ENABLE_AUDIO:
+            audio_cfg = DEFAULT_AUDIO
+
+        model = SolisMM(cfg, vision=vision_cfg, audio=audio_cfg)
+        model.lm.load_state_dict(blob["model"])
+        # Trained encoder weights, if this checkpoint has them.
+        if blob.get("modality_state"):
+            model.load_state_dict(blob["modality_state"], strict=False)
+            _encoders_trained = True
         step = (blob.get("meta") or {}).get("step", "?")
         _loaded_from = f"{CKPT.name} (step {step})"
         print(f"loaded checkpoint {CKPT} — {cfg.name}, "
-              f"{model.num_params():,} params")
+              f"{model.num_params():,} params "
+              f"(encoders: {model.encoder_params():,})")
     else:
         # Still serve, so the endpoint can be wired up before training finishes.
         # Output will be noise, and /health says so.
         cfg = get_config("mini")
         cfg.vocab_size = get_tokenizer().vocab_size
-        model = Solis(cfg)
+        vision_cfg = DEFAULT_VISION if ENABLE_VISION else None
+        audio_cfg = DEFAULT_AUDIO if ENABLE_AUDIO else None
+        model = SolisMM(cfg, vision=vision_cfg, audio=audio_cfg)
         _loaded_from = "RANDOM WEIGHTS (no checkpoint found)"
         print(f"WARNING: no checkpoint at {CKPT}; serving random weights")
+
+    if model.vision is not None or model.audio is not None:
+        if not _encoders_trained:
+            print("NOTE: media encoders are UNTRAINED — the endpoint accepts "
+                  "images/audio but cannot yet interpret them.")
     _cfg = cfg
     _model = model.to(device=DEVICE, dtype=DTYPE).eval()
     return _model
@@ -128,9 +164,17 @@ def get_model() -> Solis:
 # --------------------------------------------------------------------------- #
 # Schemas
 # --------------------------------------------------------------------------- #
+# `content` is either a plain string or a list of parts. Parts follow the
+# OpenAI multimodal shape so existing clients can talk to Solis unchanged:
+#   {"type": "text", "text": "..."}
+#   {"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}
+#   {"type": "input_audio", "input_audio": {"data": "<base64>", "format": "wav"}}
+ContentType = Union[str, List[dict]]
+
+
 class ChatMessage(BaseModel):
     role: Literal["system", "user", "assistant", "tool"]
-    content: str
+    content: ContentType
 
 
 class ChatRequest(BaseModel):
@@ -158,17 +202,82 @@ class OpenAIChatRequest(BaseModel):
 # --------------------------------------------------------------------------- #
 # Generation plumbing
 # --------------------------------------------------------------------------- #
-def _prepare_prompt(messages: List[ChatMessage]) -> torch.Tensor:
+@dataclass
+class PreparedInput:
+    ids: torch.Tensor           # (1, T) token ids incl. media placeholders
+    media: list                 # ordered slot list from the tokenizer
+    images: Optional[torch.Tensor]   # (n_images, 3, H, W) or None
+    audios: Optional[list]      # list of (n_mels, frames) tensors or None
+    prompt_tokens: int          # length AFTER media expansion
+
+
+def _normalise_content(role: str, content: ContentType, model: SolisMM) -> dict:
+    """Turn one message's content into the tokenizer's part format, decoding
+    and preprocessing any media into tensors as we go."""
+    if isinstance(content, str):
+        return {"role": role, "content": content, "_images": [], "_audios": []}
+
+    parts, images, audios = [], [], []
+    for p in content:
+        kind = p.get("type")
+        if kind == "text":
+            parts.append({"type": "text", "text": p.get("text", "")})
+        elif kind in ("image_url", "image"):
+            if not model.supports_image:
+                raise HTTPException(400, "this model has no vision encoder; "
+                                    "start the server with SOLIS_ENABLE_VISION=1 "
+                                    "or load a checkpoint with a vision encoder")
+            url = p.get("image_url", {}).get("url") if kind == "image_url" \
+                else p.get("data") or p.get("url")
+            if not url:
+                raise HTTPException(400, "image part is missing its data/url")
+            images.append(preprocess.load_image(url, model.vision_cfg))
+            parts.append({"type": "image"})
+        elif kind in ("input_audio", "audio"):
+            if not model.supports_audio:
+                raise HTTPException(400, "this model has no audio encoder; "
+                                    "start the server with SOLIS_ENABLE_AUDIO=1 "
+                                    "or load a checkpoint with an audio encoder")
+            blob = p.get("input_audio", {}).get("data") if kind == "input_audio" \
+                else p.get("data") or p.get("url")
+            if not blob:
+                raise HTTPException(400, "audio part is missing its data")
+            audios.append(preprocess.load_audio(blob, model.audio_cfg))
+            parts.append({"type": "audio"})
+        else:
+            raise HTTPException(400, f"unknown content part type {kind!r}")
+    return {"role": role, "content": parts, "_images": images, "_audios": audios}
+
+
+def _prepare_input(messages: List[ChatMessage]) -> PreparedInput:
     tok = get_tokenizer()
     model = get_model()
-    ids = tok.encode_chat([m.model_dump() for m in messages])
-    limit = model._max_cache_len()
-    if len(ids) >= limit - 16:
+
+    norm = [_normalise_content(m.role, m.content, model) for m in messages]
+    images: list = []
+    audios: list = []
+    for m in norm:
+        images.extend(m.pop("_images"))
+        audios.extend(m.pop("_audios"))
+
+    enc = tok.encode_chat_multimodal(norm)
+    ids = torch.tensor([enc["ids"]], device=DEVICE)
+
+    img_tensor = (torch.stack(images).to(DEVICE) if images else None)
+    aud_tensors = ([a.to(DEVICE) for a in audios] if audios else None)
+
+    # The real (post-expansion) length decides whether we fit the context.
+    expanded = model.expand_ids(ids, enc["media"], img_tensor, aud_tensors) \
+        if enc["media"] else ids
+    limit = model.lm._max_cache_len()
+    if expanded.shape[1] >= limit - 16:
         raise HTTPException(
             status_code=413,
-            detail=f"prompt is {len(ids)} tokens; the context window is {limit}",
+            detail=f"prompt expands to {expanded.shape[1]} tokens "
+                   f"(text + media); the context window is {limit}",
         )
-    return torch.tensor([ids], device=DEVICE), len(ids)
+    return PreparedInput(ids, enc["media"], img_tensor, aud_tensors,
+                         expanded.shape[1])
 
 
 class _ByteStreamer:
@@ -201,16 +310,22 @@ class _ByteStreamer:
         return text
 
 
-def _token_stream(prompt: torch.Tensor, req, max_new: int):
-    """Run generation on a worker thread, yielding token ids as they appear."""
+def _token_stream(prepared: PreparedInput, req, max_new: int):
+    """Run generation on a worker thread, yielding token ids as they appear.
+
+    Media (when present) is encoded once during prefill; decoding then proceeds
+    on plain token ids, so streaming is identical to the text-only path.
+    """
     model = get_model()
     q: Queue = Queue()
 
     def worker():
         try:
             with _lock:
-                generate_stream(
-                    model, prompt, max_new_tokens=max_new,
+                model.generate(
+                    prepared.ids, media=prepared.media,
+                    images=prepared.images, audios=prepared.audios,
+                    max_new_tokens=max_new,
                     temperature=req.temperature,
                     top_k=getattr(req, "top_k", 50),
                     top_p=req.top_p,
@@ -249,11 +364,20 @@ def health():
         "dtype": str(DTYPE).replace("torch.", ""),
         "params_total": model.num_params(),
         "params_active_per_token": cfg.n_active_params,
-        "context_window": model._max_cache_len(),
+        "context_window": model.lm._max_cache_len(),
         "vocab_size": cfg.vocab_size,
         "tokenizer_vocab": get_tokenizer().vocab_size,
         "experts": f"{cfg.n_experts} routed (top-{cfg.n_experts_per_tok})"
                    f" + {cfg.n_shared_experts} shared",
+        "modalities": {
+            "text": True,
+            "image": model.supports_image,
+            "audio": model.supports_audio,
+            "encoder_params": model.encoder_params(),
+            # The honest flag: with an untrained encoder the endpoint accepts
+            # media but does not understand it.
+            "encoders_trained": _encoders_trained,
+        },
     }
     if DEVICE == "cuda":
         free, total = torch.cuda.mem_get_info()
@@ -280,7 +404,8 @@ def list_models():
 @app.post("/v1/chat")
 def chat(req: ChatRequest):
     """Server-Sent Events stream — the endpoint the website consumes."""
-    prompt, prompt_tokens = _prepare_prompt(req.messages)
+    prepared = _prepare_input(req.messages)
+    prompt_tokens = prepared.prompt_tokens
     max_new = max(1, min(req.max_tokens, MAX_TOKENS))
     tok = get_tokenizer()
 
@@ -290,7 +415,7 @@ def chat(req: ChatRequest):
         t0 = time.time()
         first_token_at: Optional[float] = None
         try:
-            for token_id in _token_stream(prompt, req, max_new):
+            for token_id in _token_stream(prepared, req, max_new):
                 completion_tokens += 1
                 if first_token_at is None:
                     first_token_at = time.time()
@@ -328,7 +453,8 @@ def chat(req: ChatRequest):
 @app.post("/v1/chat/completions")
 def openai_chat(req: OpenAIChatRequest):
     """OpenAI-compatible endpoint, so existing clients work unchanged."""
-    prompt, prompt_tokens = _prepare_prompt(req.messages)
+    prepared = _prepare_input(req.messages)
+    prompt_tokens = prepared.prompt_tokens
     max_new = max(1, min(req.max_tokens, MAX_TOKENS))
     tok = get_tokenizer()
     created = int(time.time())
@@ -338,7 +464,7 @@ def openai_chat(req: OpenAIChatRequest):
     if not req.stream:
         streamer = _ByteStreamer(tok)
         parts, n = [], 0
-        for token_id in _token_stream(prompt, req, max_new):
+        for token_id in _token_stream(prepared, req, max_new):
             n += 1
             parts.append(streamer.push(token_id))
         parts.append(streamer.flush())
@@ -364,7 +490,7 @@ def openai_chat(req: OpenAIChatRequest):
             "choices": [{"index": 0, "delta": {"role": "assistant"},
                          "finish_reason": None}]}) + "\n\n")
         n = 0
-        for token_id in _token_stream(prompt, req, max_new):
+        for token_id in _token_stream(prepared, req, max_new):
             n += 1
             text = streamer.push(token_id)
             if text:

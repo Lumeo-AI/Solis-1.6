@@ -1,12 +1,18 @@
 """Train Solis from scratch.
 
-    python data/build_corpus.py          # 1. generate the corpus
-    python data/train_tokenizer.py       # 2. learn the BPE vocabulary
-    python data/prepare.py               # 3. tokenise + pack to .bin
-    python train.py                      # 4. train
+    # option A — real-world data (recommended):
+    python data/ingest.py --hf <dataset> --out data/corpus.jsonl
+    # option B — the built-in procedural corpus:
+    python data/build_corpus.py
+
+    python data/train_tokenizer.py       # learn the BPE vocabulary
+    python data/prepare.py               # tokenise + pack to .bin
+    python train.py                      # train
 
 Everything starts from random weights. There is no base model, no pretrained
-checkpoint, and no imported vocabulary anywhere in this pipeline.
+checkpoint, and no imported vocabulary anywhere in this pipeline. This trainer
+optimises the language model; the image/audio encoders in solis/multimodal.py
+are trained separately and are out of scope here.
 
 Recipe notes, since the choices here are load-bearing:
 

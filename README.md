@@ -71,7 +71,10 @@ at a time — `tests/test_model.py` checks exactly this.
 python -m venv .venv && .venv/Scripts/activate   # Linux/macOS: source .venv/bin/activate
 pip install -r requirements.txt
 
-python data/build_corpus.py      # 1. generate the corpus
+# 1. get a corpus — real-world data (recommended) OR the procedural fallback
+python data/ingest.py --hf <dataset-id> --out data/corpus.jsonl
+#   ...or: python data/build_corpus.py
+
 python data/train_tokenizer.py   # 2. learn the BPE vocabulary
 python data/prepare.py           # 3. tokenise + pack to .bin
 python train.py                  # 4. train  -> checkpoints/solis-mini.pt
@@ -81,17 +84,33 @@ python bench.py                  # real VRAM and throughput
 uvicorn serve:app --port 8000    # serve
 ```
 
-Run the tests with `python tests/test_model.py`.
+Run the tests with `python tests/test_model.py` and
+`python tests/test_multimodal.py`.
 
-## Training
+## Training on real-world data
+
+`data/ingest.py` converts existing datasets into the corpus format the rest of
+the pipeline reads, so training is not limited to the built-in procedural text.
+It normalises the common chat schemas — `messages`, split
+`system`/`user`/`assistant` columns, ShareGPT `conversations`,
+`prompt`/`response` pairs, and raw `text` — from Hugging Face datasets or local
+JSONL / text files, and writes a train/val split.
+
+```bash
+python data/ingest.py \
+    --hf oyildirim/cyberstrike-sft-120k \
+    --hf SkywardNomad92/pentest-findings-v2 \
+    --out data/corpus.jsonl
+python data/train_tokenizer.py && python data/prepare.py
+python train.py --preset mini
+```
 
 `train.py` uses fp32 master weights with bf16 autocast, gradient accumulation,
 gradient checkpointing (on by default — a top-k MoE stores `k` copies of every
 intermediate, so recomputation is worth much more here than in a dense model),
-cosine decay after warmup, and no weight decay on norms or embeddings.
-
-The micro-batch is chosen automatically from free VRAM, and an OOM anywhere in
-the step halves it and retries rather than losing the run.
+cosine decay after warmup, and no weight decay on norms or embeddings. The
+micro-batch is chosen automatically from free VRAM, and an OOM anywhere in the
+step halves it and retries rather than losing the run.
 
 ```bash
 python train.py --preset mini --max-minutes 90
@@ -103,27 +122,56 @@ python train.py --preset small --adam8bit    # 8-bit optimizer states
 inference-only at that size — training them needs roughly 55 GB and 77 GB of
 optimizer state respectively, which is a multi-GPU or offloaded job.
 
+## Image and voice input
+
+Solis accepts pictures and audio clips alongside text. Each media item is run
+through a small from-scratch encoder — a ViT for images, a log-mel + conv +
+transformer stack for audio (`solis/multimodal.py`) — projected to the model's
+width, and spliced into the token stream in place of an `<|image|>` or
+`<|audio|>` placeholder. From the transformer's side they are just more
+positions, so attention, the KV cache and streaming generation are unchanged.
+
+The server speaks the OpenAI multimodal content-parts format:
+
+```jsonc
+{ "messages": [{ "role": "user", "content": [
+    { "type": "text", "text": "what is in this picture?" },
+    { "type": "image_url", "image_url": { "url": "data:image/png;base64,..." } },
+    { "type": "input_audio", "input_audio": { "data": "<base64 wav>", "format": "wav" } }
+]}]}
+```
+
+Enable the encoders with `SOLIS_ENABLE_VISION=1` / `SOLIS_ENABLE_AUDIO=1`, or by
+loading a checkpoint that carries trained encoders. WAV audio is decoded with no
+extra dependencies; other formats need a torchaudio backend.
+
+> **The encoders ship untrained.** The full path works end to end — you can post
+> an image or a clip today — but until the encoders and their projectors are
+> trained on paired data the model *accepts* media without *understanding* it.
+> `/health` reports `modalities.encoders_trained: false` so this is never
+> ambiguous. Training them is a separate job from `train.py`, which optimises
+> the language model only.
+
 ## The corpus
 
-Everything in `data/build_corpus.py` is generated procedurally. Nothing is
-scraped and nothing is copyrighted, which keeps the from-scratch claim true end
-to end.
+There are two ways to feed Solis, and they trade off provenance against
+capability:
 
-The generator is weighted deliberately. A model this size cannot store facts
-about the world, so teaching it trivia wastes capacity. What it *can* learn is
-**in-context work**: answer from the passage you were given, transform this
-text, follow this format, carry state across turns. Roughly two thirds of the
-corpus is tasks of that shape, where the answer is derivable from the prompt
-rather than recalled — including questions the passage deliberately does not
-answer, so that "the passage doesn't say" is a trained response rather than an
-accident.
+**Real-world data (`data/ingest.py`)** is the recommended path and what the
+model is intended to train on. It pulls existing datasets — Hugging Face,
+local JSONL, or plain text — normalises their schema, and produces the packed
+corpus. This is where broad vocabulary and real knowledge come from; BPE no
+longer saturates early because the text has genuine lexical diversity.
 
-**This is also the model's main limitation.** A procedural corpus has bounded
-lexical diversity: BPE training saturates at ~5k merges because there are only
-~5k unique pre-tokens in it. Solis is genuinely good at the task shapes it was
-trained on and will not have broad world knowledge. Pointing the pipeline at a
-large natural-language corpus is the single highest-leverage change available —
-`data/prepare.py` accepts any JSONL with a `messages` field.
+**The procedural generator (`data/build_corpus.py`)** writes everything from
+templates — nothing scraped, nothing copyrighted. It is ideal for standing the
+pipeline up and for teaching **in-context work** (answer from the given passage,
+transform this text, follow this format), but a model trained only on it has
+bounded vocabulary (~5k unique pre-tokens) and no world knowledge. Use it as a
+fallback or to supplement real data with clean task-format examples.
+
+Either way the output is `data/corpus.jsonl` + `data/corpus.val.jsonl`, and
+`data/prepare.py` consumes any JSONL with a `messages` field.
 
 ## Serving API
 

@@ -44,8 +44,14 @@ SPECIAL_TOKENS: list[str] = [
     "<|tool_result|>",  # 263
     "<|think|>",      # 264
     "<|/think|>",     # 265
-    "<|reserved_0|>", "<|reserved_1|>", "<|reserved_2|>",
-    "<|reserved_3|>", "<|reserved_4|>", "<|reserved_5|>",
+    # Media placeholders. One of these appears in the token stream per attached
+    # image/audio clip; the multimodal model replaces it with the projected
+    # encoder embeddings (see solis/multimodal.py). They occupy what used to be
+    # reserved slots, so their ids match older checkpoints and no learned merge
+    # id shifts.
+    "<|image|>",      # 266
+    "<|audio|>",      # 267
+    "<|reserved_2|>", "<|reserved_3|>", "<|reserved_4|>", "<|reserved_5|>",
 ]
 SPECIAL_BASE = 256
 SPECIAL_END = SPECIAL_BASE + len(SPECIAL_TOKENS)  # first id available for merges
@@ -59,6 +65,8 @@ EOS = SPECIAL_IDS["<|eos|>"]
 SYSTEM = SPECIAL_IDS["<|system|>"]
 USER = SPECIAL_IDS["<|user|>"]
 ASSISTANT = SPECIAL_IDS["<|assistant|>"]
+IMAGE = SPECIAL_IDS["<|image|>"]
+AUDIO = SPECIAL_IDS["<|audio|>"]
 
 # Pre-tokenisation pattern. Splitting on this before merging keeps BPE from
 # learning merges that straddle word/punctuation boundaries, which is what makes
@@ -179,6 +187,49 @@ class SolisTokenizer:
             ids.append(ASSISTANT)
         return ids
 
+    def encode_chat_multimodal(self, messages: Sequence[dict]) -> dict:
+        """Render a conversation that may contain images and audio.
+
+        A message's ``content`` is either a plain string, or a list of parts:
+
+            {"role": "user", "content": [
+                {"type": "text",  "text": "what is in this picture?"},
+                {"type": "image"},                # one <|image|> placeholder
+                {"type": "audio"},                # one <|audio|> placeholder
+            ]}
+
+        Returns the token ids plus the ordered list of media slots — each a
+        ``{"kind": "image"|"audio", "index": <position in ids>}`` — so the
+        multimodal model knows exactly where to splice each encoder's output.
+        The media payloads themselves (pixels, waveforms) travel separately;
+        the tokenizer only reserves their place in the sequence.
+        """
+        role_tok = {"system": SYSTEM, "user": USER, "assistant": ASSISTANT,
+                    "tool": SPECIAL_IDS["<|tool|>"]}
+        ids: list[int] = [BOS]
+        media: list[dict] = []
+        for m in messages:
+            ids.append(role_tok.get(m["role"], USER))
+            content = m["content"]
+            if isinstance(content, str):
+                ids.extend(self.encode(content))
+            else:
+                for part in content:
+                    kind = part.get("type")
+                    if kind == "text":
+                        ids.extend(self.encode(part.get("text", "")))
+                    elif kind == "image":
+                        media.append({"kind": "image", "index": len(ids)})
+                        ids.append(IMAGE)
+                    elif kind == "audio":
+                        media.append({"kind": "audio", "index": len(ids)})
+                        ids.append(AUDIO)
+                    else:
+                        raise ValueError(f"unknown content part type {kind!r}")
+            ids.append(EOS)
+        ids.append(ASSISTANT)
+        return {"ids": ids, "media": media}
+
     def encode_chat_supervised(self, messages: Sequence[dict]
                                ) -> tuple[list[int], list[int]]:
         """Same layout, plus a 0/1 mask marking the tokens worth learning.
@@ -214,10 +265,19 @@ class SolisTokenizer:
     @classmethod
     def load(cls, path: str | Path) -> "SolisTokenizer":
         blob = json.loads(Path(path).read_text(encoding="utf-8"))
-        if blob.get("special_tokens") != SPECIAL_TOKENS:
+        saved = blob.get("special_tokens", [])
+        # What actually has to match is the *count* and base: those fix where the
+        # learned merge ids begin. Renaming a reserved slot (e.g. to <|image|>)
+        # keeps every merge id stable, so a tokenizer trained before the media
+        # tokens existed still loads. A different length would shift merges and
+        # is a genuine mismatch.
+        if len(saved) != len(SPECIAL_TOKENS) or \
+                blob.get("special_base", SPECIAL_BASE) != SPECIAL_BASE:
             raise ValueError(
-                "tokenizer file was built with a different special-token set; "
-                "retrain it or restore the matching solis/tokenizer.py"
+                f"tokenizer file has {len(saved)} special tokens at base "
+                f"{blob.get('special_base')}, but this build expects "
+                f"{len(SPECIAL_TOKENS)} at base {SPECIAL_BASE}; retrain it or "
+                "restore the matching solis/tokenizer.py"
             )
         return cls(merges=[tuple(m) for m in blob["merges"]])
 

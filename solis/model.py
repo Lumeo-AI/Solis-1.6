@@ -536,11 +536,17 @@ class Solis(nn.Module):
         return self._rope
 
     # -- forward ----------------------------------------------------------- #
-    def forward(self, idx, targets=None, cache: Optional[KVCache] = None,
+    def forward(self, idx=None, targets=None, cache: Optional[KVCache] = None,
                 offset: int = 0, loss_reduction: str = "mean",
-                return_logits: bool = False):
-        B, T = idx.shape
-        x = self.drop(self.tok_emb(idx))
+                return_logits: bool = False, inputs_embeds=None):
+        # `inputs_embeds` lets the multimodal wrapper hand in a sequence that
+        # already has image/audio embeddings spliced in place of their
+        # placeholder tokens. Everything downstream is identical either way.
+        if inputs_embeds is None:
+            x = self.drop(self.tok_emb(idx))
+        else:
+            x = self.drop(inputs_embeds)
+        B, T = x.shape[0], x.shape[1]
         cos, sin = self._rope_cache(offset + T, x.device)
 
         aux_total = x.new_zeros(())
@@ -597,13 +603,18 @@ class Solis(nn.Module):
         return generate_stream(self, idx, **kw)
 
 
-def _forward_hidden(model: "Solis", idx, cache, offset):
-    """Run the stack and return the final normed hidden states."""
-    x = model.tok_emb(idx)
-    cos, sin = model._rope_cache(offset + idx.shape[1], x.device)
+def _forward_hidden(model: "Solis", idx, cache, offset, inputs_embeds=None):
+    """Run the stack and return the final normed hidden states.
+
+    Accepts either token ids or precomputed embeddings; prefill with media uses
+    the latter, single-token decode uses the former.
+    """
+    x = model.tok_emb(idx) if inputs_embeds is None else inputs_embeds
+    T = x.shape[1]
+    cos, sin = model._rope_cache(offset + T, x.device)
     for block in model.blocks:
         x, _aux = block(x, cos, sin, cache, offset)
-    cache.advance(idx.shape[1])
+    cache.advance(T)
     return model.norm(x)
 
 
@@ -656,18 +667,27 @@ def generate_stream(model: "Solis", idx: torch.Tensor, max_new_tokens: int = 256
                     temperature: float = 0.8, top_k: int = 50, top_p: float = 0.95,
                     min_p: float = 0.0, repetition_penalty: float = 1.05,
                     eos_id: Optional[int] = None, stop_ids: tuple = (),
-                    stream_cb=None, seed: Optional[int] = None):
+                    stream_cb=None, seed: Optional[int] = None,
+                    inputs_embeds: Optional[torch.Tensor] = None):
     """Prefill + incremental decode with a KV cache.
 
     Yields nothing; calls `stream_cb(token_id)` per token and returns the full
     id tensor. Kept as a module-level function so the server can call it
     without holding a method reference to a compiled module.
+
+    For multimodal input, `idx` still carries the full token sequence (with
+    media placeholders, so repetition penalty and the returned ids stay
+    correct) while `inputs_embeds` carries the same sequence with encoder
+    embeddings already spliced in. Prefill runs on the embeddings; decoding
+    then proceeds on token ids as usual.
     """
     model.eval()
     device = idx.device
     B, T = idx.shape
     if B != 1:
         raise ValueError("generate_stream handles one sequence at a time")
+    if inputs_embeds is not None and inputs_embeds.shape[1] != T:
+        raise ValueError("inputs_embeds and idx must describe the same length")
 
     gen = torch.Generator(device=device).manual_seed(seed) if seed is not None else None
 
@@ -678,8 +698,8 @@ def generate_stream(model: "Solis", idx: torch.Tensor, max_new_tokens: int = 256
         )
     cache = KVCache(model.cfg, B, cache_len, device, model.tok_emb.weight.dtype)
 
-    # Prefill.
-    h = _forward_hidden(model, idx, cache, offset=0)
+    # Prefill — on spliced embeddings when there is media, on ids otherwise.
+    h = _forward_hidden(model, idx, cache, offset=0, inputs_embeds=inputs_embeds)
     logits = model.lm_head(h[:, -1, :])
 
     produced = []
