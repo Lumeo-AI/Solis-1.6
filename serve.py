@@ -10,13 +10,23 @@ Environment:
     SOLIS_DEVICE    cuda | cpu           (default: cuda when available)
     SOLIS_DTYPE     bfloat16 | float16 | float32
     SOLIS_MAX_TOKENS hard cap on completion length (default 1024)
+    SOLIS_MCP_CONFIG path to an mcpServers JSON file — enables tool calling
+    SOLIS_MCP_MAX_ROUNDS max tool round-trips per request (default 5)
+    SOLIS_MCP_TIMEOUT    per-call MCP timeout in seconds (default 30)
     PORT            listen port          (default 8000)
 
 Endpoints:
-    GET  /health                  device, VRAM, parameter counts
+    GET  /health                  device, VRAM, parameter counts, MCP status
     GET  /v1/models               OpenAI-style model listing
+    GET  /v1/mcp/tools            tools exposed by the configured MCP servers
+    POST /v1/mcp/call             invoke one MCP tool directly (debugging)
     POST /v1/chat                 Server-Sent Events (the website's endpoint)
     POST /v1/chat/completions     OpenAI-compatible, streaming or not
+
+Tool calling: when SOLIS_MCP_CONFIG points at MCP servers, the chat endpoints
+let the model request those tools; each call is executed server-side and its
+result fed back for another turn, until the model answers in plain text. The
+SSE endpoint emits `tool_call` / `tool_result` events as the loop runs.
 
 Streaming is byte-aware: a BPE token can end mid-UTF-8-character, so partial
 bytes are held back until they form a complete character rather than being
@@ -46,6 +56,8 @@ from solis.model import generate_stream
 from solis.multimodal import SolisMM, DEFAULT_VISION, DEFAULT_AUDIO
 from solis import preprocess
 from solis.tokenizer import SolisTokenizer, EOS
+from solis.mcp import (MCPManager, MCPError, render_tools_prompt,
+                       parse_tool_calls, ParsedCall)
 
 
 def _envflag(name: str) -> bool:
@@ -64,6 +76,11 @@ MAX_TOKENS = int(os.environ.get("SOLIS_MAX_TOKENS", "1024"))
 # yet interpret them (/health flags this as encoders_trained: false).
 ENABLE_VISION = _envflag("SOLIS_ENABLE_VISION")
 ENABLE_AUDIO = _envflag("SOLIS_ENABLE_AUDIO")
+# MCP tool calling. Point SOLIS_MCP_CONFIG at a JSON file using the standard
+# `mcpServers` shape and the endpoints will let the model call those tools,
+# executing them server-side between generation turns. Absent config, every
+# endpoint behaves exactly as before.
+MAX_TOOL_ROUNDS = int(os.environ.get("SOLIS_MCP_MAX_ROUNDS", "5"))
 
 _DTYPES = {"bfloat16": torch.bfloat16, "float16": torch.float16,
            "float32": torch.float32}
@@ -98,6 +115,8 @@ _tok: Optional[SolisTokenizer] = None
 _cfg: Optional[SolisConfig] = None
 _loaded_from = "uninitialised"
 _encoders_trained = False
+_mcp: Optional[MCPManager] = None
+_mcp_init = False
 # One model, one CUDA stream: generation is serialised. Batching concurrent
 # requests would need a paged KV cache, which is out of scope for this server.
 _lock = threading.Lock()
@@ -113,6 +132,33 @@ def get_tokenizer() -> SolisTokenizer:
                   "falling back to raw bytes")
             _tok = SolisTokenizer(merges=[])
     return _tok
+
+
+def get_mcp() -> Optional[MCPManager]:
+    """Lazily build and connect the MCP manager from $SOLIS_MCP_CONFIG.
+
+    Connection is attempted once; a failure to load the config disables tools
+    for the process rather than crashing the server, and per-server failures are
+    isolated inside the manager (see MCPManager.connect).
+    """
+    global _mcp, _mcp_init
+    if _mcp_init:
+        return _mcp
+    _mcp_init = True
+    try:
+        _mcp = MCPManager.from_env("SOLIS_MCP_CONFIG")
+    except Exception as exc:
+        print(f"WARNING: MCP disabled — {exc}")
+        _mcp = None
+        return None
+    if _mcp is not None:
+        status = _mcp.connect()
+        for name, err in status.items():
+            if err:
+                print(f"WARNING: MCP server {name!r} failed: {err}")
+            else:
+                print(f"MCP server {name!r} connected")
+    return _mcp
 
 
 def get_model() -> SolisMM:
@@ -186,6 +232,11 @@ class ChatRequest(BaseModel):
     min_p: float = 0.0
     repetition_penalty: float = 1.05
     seed: Optional[int] = None
+    # Tool calling. When MCP servers are configured, `use_tools` lets the model
+    # request them and executes the calls between turns; a client can set it
+    # false to force a plain text answer.
+    use_tools: bool = True
+    max_tool_rounds: Optional[int] = None
 
 
 class OpenAIChatRequest(BaseModel):
@@ -197,6 +248,13 @@ class OpenAIChatRequest(BaseModel):
     stream: bool = False
     seed: Optional[int] = None
     frequency_penalty: float = Field(default=0.0, ge=-2.0, le=2.0)
+    use_tools: bool = True
+    max_tool_rounds: Optional[int] = None
+
+
+class MCPCallRequest(BaseModel):
+    name: str
+    arguments: dict = Field(default_factory=dict)
 
 
 # --------------------------------------------------------------------------- #
@@ -349,6 +407,114 @@ def _token_stream(prepared: PreparedInput, req, max_new: int):
 
 
 # --------------------------------------------------------------------------- #
+# Tool calling (MCP)
+# --------------------------------------------------------------------------- #
+# The generation loop above streams token ids. When tools are in play we need a
+# turn's *whole* text before we can tell whether it is a tool call, so these run
+# generation to completion and inspect the result. A turn is generated once and
+# either handed back as the final answer or parsed for calls — never twice.
+def _tools_active(use_tools: bool) -> list:
+    """The tools available for this request, or [] when tools are off/unset."""
+    if not use_tools:
+        return []
+    mcp = get_mcp()
+    if mcp is None:
+        return []
+    try:
+        return mcp.tools()
+    except Exception as exc:
+        print(f"WARNING: could not list MCP tools: {exc}")
+        return []
+
+
+def _inject_tools(messages: List[ChatMessage], tools: list) -> List[ChatMessage]:
+    """Prepend a system message teaching the model this session's tools.
+
+    If the conversation already opens with a system message we extend it, so the
+    caller's own instructions survive.
+    """
+    fragment = render_tools_prompt(tools)
+    if not fragment:
+        return list(messages)
+    out = [ChatMessage(**m.model_dump()) for m in messages]
+    if out and out[0].role == "system" and isinstance(out[0].content, str):
+        out[0] = ChatMessage(role="system",
+                             content=out[0].content.rstrip() + "\n\n" + fragment)
+    else:
+        out.insert(0, ChatMessage(role="system", content=fragment))
+    return out
+
+
+def _format_tool_result(name: str, payload: str, is_error: bool) -> str:
+    tag = "error" if is_error else "result"
+    return f"{name} {tag}:\n{payload}"
+
+
+def _generate_message(messages: List[ChatMessage], req, max_new: int) -> str:
+    """Run one full generation turn and return its decoded text."""
+    prepared = _prepare_input(messages)
+    tok = get_tokenizer()
+    streamer = _ByteStreamer(tok)
+    parts: list[str] = []
+    for token_id in _token_stream(prepared, req, max_new):
+        parts.append(streamer.push(token_id))
+    parts.append(streamer.flush())
+    return "".join(parts)
+
+
+def _run_tool_rounds(messages: List[ChatMessage], req, max_new: int,
+                     tools: list, on_event: Optional[callable] = None
+                     ) -> tuple[List[ChatMessage], str]:
+    """Drive the agent loop until the model answers without calling a tool.
+
+    Returns the (possibly extended) message list and the final assistant text.
+    `on_event`, if given, is called with dicts describing each tool call and its
+    result so an SSE endpoint can surface progress live.
+    """
+    mcp = get_mcp()
+    rounds = req.max_tool_rounds if req.max_tool_rounds is not None \
+        else MAX_TOOL_ROUNDS
+    work = _inject_tools(messages, tools)
+
+    for _ in range(max(0, rounds)):
+        text = _generate_message(work, req, max_new)
+        calls: list[ParsedCall] = parse_tool_calls(text)
+        if not calls:
+            return work, text
+        # Record the model's tool-request turn verbatim, then service each call.
+        work.append(ChatMessage(role="assistant", content=text))
+        for call in calls:
+            if on_event:
+                on_event({"type": "tool_call", "name": call.name,
+                          "arguments": call.arguments})
+            try:
+                result = mcp.call(call.name, call.arguments)
+                payload = result.text or "(the tool returned no output)"
+                is_error = result.is_error
+            except Exception as exc:
+                payload, is_error = f"{exc}", True
+            if on_event:
+                on_event({"type": "tool_result", "name": call.name,
+                          "is_error": is_error, "content": payload})
+            work.append(ChatMessage(
+                role="tool",
+                content=_format_tool_result(call.name, payload, is_error)))
+
+    # Rounds exhausted: take one last turn, tools no longer offered as an option.
+    final = _generate_message(work, req, max_new)
+    # Strip any dangling tool-call syntax so the user sees prose, not a call.
+    for call in parse_tool_calls(final):
+        final = final.replace(call.raw, "").strip()
+    return work, final
+
+
+def _chunk_text(text: str, size: int = 8):
+    """Yield a buffered final answer in small slices, to keep SSE incremental."""
+    for i in range(0, len(text), size):
+        yield text[i:i + size]
+
+
+# --------------------------------------------------------------------------- #
 # Endpoints
 # --------------------------------------------------------------------------- #
 @app.get("/health")
@@ -379,6 +545,17 @@ def health():
             "encoders_trained": _encoders_trained,
         },
     }
+    mcp = get_mcp()
+    if mcp is not None:
+        servers = mcp.status()
+        info["mcp"] = {
+            "enabled": True,
+            "servers": servers,
+            "tool_count": sum(len(s["tools"]) for s in servers
+                              if s["connected"]),
+        }
+    else:
+        info["mcp"] = {"enabled": False}
     if DEVICE == "cuda":
         free, total = torch.cuda.mem_get_info()
         info["vram"] = {
@@ -401,13 +578,75 @@ def list_models():
     }]}
 
 
+@app.get("/v1/mcp/tools")
+def mcp_tools():
+    """List the tools exposed by every connected MCP server (OpenAI-shaped)."""
+    mcp = get_mcp()
+    if mcp is None:
+        return {"object": "list", "data": [], "enabled": False}
+    tools = mcp.tools()
+    return {
+        "object": "list",
+        "enabled": True,
+        "data": [t.to_openai() for t in tools],
+        "servers": mcp.status(),
+    }
+
+
+@app.post("/v1/mcp/call")
+def mcp_call(req: MCPCallRequest):
+    """Invoke one MCP tool directly — handy for debugging a server wiring."""
+    mcp = get_mcp()
+    if mcp is None:
+        raise HTTPException(400, "MCP is not configured (set SOLIS_MCP_CONFIG)")
+    try:
+        result = mcp.call(req.name, req.arguments)
+    except MCPError as exc:
+        raise HTTPException(400, str(exc))
+    return {"name": req.name, "is_error": result.is_error,
+            "content": result.text, "raw": result.raw}
+
+
 @app.post("/v1/chat")
 def chat(req: ChatRequest):
     """Server-Sent Events stream — the endpoint the website consumes."""
-    prepared = _prepare_input(req.messages)
-    prompt_tokens = prepared.prompt_tokens
+    tools = _tools_active(req.use_tools)
     max_new = max(1, min(req.max_tokens, MAX_TOKENS))
     tok = get_tokenizer()
+
+    # --- Tool path: run the agent loop, streaming progress + the final text. ---
+    if tools:
+        def tool_stream():
+            t0 = time.time()
+            events: list[dict] = []
+            try:
+                _, final = _run_tool_rounds(
+                    req.messages, req, max_new, tools, on_event=events.append)
+            except Exception as exc:
+                yield f"data: {json.dumps({'type': 'error', 'message': str(exc)})}\n\n"
+                return
+            # `events` were collected during the (synchronous) loop; replay them
+            # before the answer so a client sees which tools ran.
+            for ev in events:
+                yield f"data: {json.dumps(ev)}\n\n"
+            for piece in _chunk_text(final):
+                yield f"data: {json.dumps({'type': 'token', 'text': piece})}\n\n"
+            done = {
+                "type": "done",
+                "usage": {"completion_tokens": len(final)},
+                "timing": {"total_seconds": round(time.time() - t0, 3)},
+                "tools_used": [e["name"] for e in events
+                               if e["type"] == "tool_call"],
+            }
+            yield f"data: {json.dumps(done)}\n\n"
+
+        return StreamingResponse(tool_stream(), media_type="text/event-stream",
+                                 headers={"Cache-Control": "no-cache",
+                                          "X-Accel-Buffering": "no"})
+
+    # --- Plain path: unchanged true token-by-token streaming. ---
+    prepared = _prepare_input(req.messages)
+    prompt_tokens = prepared.prompt_tokens
 
     def event_stream():
         streamer = _ByteStreamer(tok)
@@ -453,13 +692,55 @@ def chat(req: ChatRequest):
 @app.post("/v1/chat/completions")
 def openai_chat(req: OpenAIChatRequest):
     """OpenAI-compatible endpoint, so existing clients work unchanged."""
-    prepared = _prepare_input(req.messages)
-    prompt_tokens = prepared.prompt_tokens
     max_new = max(1, min(req.max_tokens, MAX_TOKENS))
     tok = get_tokenizer()
     created = int(time.time())
     resp_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
     model_name = _cfg.name if _cfg else req.model
+    tools = _tools_active(req.use_tools)
+
+    # --- Tool path: MCP calls are executed server-side; the client gets the
+    # final answer (streamed as content chunks) just like a plain completion. ---
+    if tools:
+        events: list[dict] = []
+        _, text = _run_tool_rounds(req.messages, req, max_new, tools,
+                                   on_event=events.append)
+        tools_used = [e["name"] for e in events if e["type"] == "tool_call"]
+        if not req.stream:
+            return {
+                "id": resp_id, "object": "chat.completion", "created": created,
+                "model": model_name,
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": text},
+                    "finish_reason": "stop",
+                }],
+                "usage": {"completion_tokens": len(text)},
+                "solis_tools_used": tools_used,
+            }
+
+        def tool_completion_stream():
+            base = {"id": resp_id, "object": "chat.completion.chunk",
+                    "created": created, "model": model_name}
+            yield ("data: " + json.dumps({
+                **base, "choices": [{"index": 0, "delta": {"role": "assistant"},
+                                     "finish_reason": None}]}) + "\n\n")
+            for piece in _chunk_text(text):
+                yield ("data: " + json.dumps({
+                    **base, "choices": [{"index": 0, "delta": {"content": piece},
+                                         "finish_reason": None}]}) + "\n\n")
+            yield ("data: " + json.dumps({
+                **base, "choices": [{"index": 0, "delta": {},
+                                     "finish_reason": "stop"}]}) + "\n\n")
+            yield "data: [DONE]\n\n"
+
+        return StreamingResponse(tool_completion_stream(),
+                                 media_type="text/event-stream",
+                                 headers={"Cache-Control": "no-cache",
+                                          "X-Accel-Buffering": "no"})
+
+    prepared = _prepare_input(req.messages)
+    prompt_tokens = prepared.prompt_tokens
 
     if not req.stream:
         streamer = _ByteStreamer(tok)

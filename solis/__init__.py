@@ -10,6 +10,16 @@ from .multimodal import (
     DEFAULT_VISION,
     DEFAULT_AUDIO,
 )
+from .mcp import (
+    MCPManager,
+    MCPClient,
+    ServerConfig,
+    Tool,
+    ToolResult,
+    MCPError,
+    render_tools_prompt,
+    parse_tool_calls,
+)
 
 __all__ = [
     "SolisConfig",
@@ -25,5 +35,13 @@ __all__ = [
     "AudioConfig",
     "DEFAULT_VISION",
     "DEFAULT_AUDIO",
+    "MCPManager",
+    "MCPClient",
+    "ServerConfig",
+    "Tool",
+    "ToolResult",
+    "MCPError",
+    "render_tools_prompt",
+    "parse_tool_calls",
 ]
 __version__ = "1.1.0"

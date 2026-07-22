@@ -201,6 +201,58 @@ bytes are held back until they form a complete character.
 Environment: `SOLIS_CKPT`, `SOLIS_TOKENIZER`, `SOLIS_DEVICE`, `SOLIS_DTYPE`,
 `SOLIS_MAX_TOKENS`, `SOLIS_CORS_ORIGINS`, `PORT`.
 
+## Tool calling (MCP)
+
+Solis can reach out to external tools over the **Model Context Protocol** — a
+filesystem browser, a database, a web fetcher, anything that speaks MCP — and
+fold their results back into the conversation. It is pure serving-side plumbing
+(`solis/mcp.py`); nothing about the model changes, and the language model is not
+retrained. The loop is simply:
+
+```
+render tools -> model asks for a call -> we run it over MCP -> feed result back
+```
+
+Point `SOLIS_MCP_CONFIG` at a JSON file using the same `mcpServers` shape the
+other MCP clients use — an existing config drops straight in:
+
+```jsonc
+{
+  "mcpServers": {
+    "fs":   { "command": "npx",
+              "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"] },
+    "docs": { "url": "https://example.com/mcp",
+              "headers": { "Authorization": "Bearer ..." } }
+  }
+}
+```
+
+```bash
+SOLIS_MCP_CONFIG=mcp.example.json uvicorn serve:app --port 8000
+```
+
+Both **stdio** (subprocess) and **streamable-HTTP** servers are supported, with
+the standard library only — no new dependencies. Tools are namespaced
+`<server>__<tool>` so two servers can expose the same tool name. A from-scratch
+model has not memorised any provider's function-calling grammar, so the server
+teaches it a dead-simple one in the system prompt:
+
+```
+<tool_call>{"name": "fs__read_file", "arguments": {"path": "/tmp/x"}}</tool_call>
+```
+
+The chat endpoints execute any calls the model emits and continue until it
+answers in plain text (bounded by `SOLIS_MCP_MAX_ROUNDS`, default 5). `/v1/chat`
+also emits `tool_call` / `tool_result` SSE events so a client can show progress.
+Set `"use_tools": false` on a request to force a plain answer.
+
+- `GET  /v1/mcp/tools` — the tools every connected server exposes (OpenAI shape)
+- `POST /v1/mcp/call`  — invoke one tool directly, e.g. to check a server wiring
+- `GET  /health` — reports per-server MCP status alongside the model info
+
+Config errors disable tools with a warning instead of crashing the server, and
+one server failing to start never takes the others (or the endpoint) down.
+
 ## Website data
 
 The companion site lives on a separate machine, not in this repo. The numbers
