@@ -64,6 +64,7 @@ largest actual group, which costs one device-to-host read per layer but
 guarantees a token's output never depends on which other tokens shared its
 batch. Without that split, a prefill disagrees with the same tokens decoded one
 at a time — `tests/test_model.py` checks exactly this.
+<<<<<<< HEAD
 
 ## Quickstart
 
@@ -207,3 +208,5 @@ it needs come from the measurement scripts here: `python eval.py` writes
 `results/eval.json` (task accuracy, validation perplexity) and `python bench.py`
 writes `results/bench.json` (real VRAM and throughput per preset). Every Solis
 number in those files is measured on the machine that produced it.
+=======
+>>>>>>> 0bc936d61329966639da9dc8f967c059ea2f1d3c
