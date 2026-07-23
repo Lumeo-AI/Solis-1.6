@@ -1,8 +1,8 @@
-"""Image analysis for Solis 1.9 — vision-language via Qwen2.5-VL.
+"""Image analysis for Solis 1.9 — vision-language via Qwen3-VL.
 
 Unlike the text engine, a vision model needs both the image and the text in the
 same forward pass, so this is its own model rather than a front end. It loads
-Qwen2.5-VL (lazy, on first use — not cached by default) and answers questions
+Qwen3-VL (lazy, on first use — not cached by default) and answers questions
 about images while presenting as Solis.
 
 Held separate from the text engine so a text-only deployment never pays the
@@ -51,7 +51,7 @@ class VisionEngine:
         elif device == "cuda":
             kwargs["device_map"] = "auto"
 
-        # Qwen2.5-VL uses a dedicated model class.
+        # Qwen3-VL uses a dedicated model class.
         try:
             from transformers import Qwen2_5_VLForConditionalGeneration as VLModel
         except ImportError:  # older transformers

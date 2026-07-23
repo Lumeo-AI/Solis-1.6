@@ -1,4 +1,4 @@
-"""Solis 1.9 — a branded, fine-tuned build of open foundation models (Qwen2.5),
+"""Solis 1.9 — a branded, fine-tuned build of open foundation models (Qwen3),
 with image and voice analysis and a deferred image-generation hook."""
 
 from .registry import (

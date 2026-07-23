@@ -1,0 +1,22 @@
+{
+  "//": "Example MCP server config for Solis. Point SOLIS_MCP_CONFIG at a copy.",
+  "//stdio": "A local server launched as a subprocess (stdin/stdout JSON-RPC).",
+  "//http": "A remote server over the streamable-HTTP transport.",
+  "//note": "Tools are namespaced <server>__<tool>, e.g. fs__read_file.",
+  "mcpServers": {
+    "fs": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+    },
+    "memory": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-memory"],
+      "disabled": true
+    },
+    "remote": {
+      "url": "https://example.com/mcp",
+      "headers": { "Authorization": "Bearer YOUR_TOKEN_HERE" },
+      "disabled": true
+    }
+  }
+}

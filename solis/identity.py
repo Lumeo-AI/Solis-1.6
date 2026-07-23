@@ -8,7 +8,7 @@ identifying as Solis even without the prompt.
 
 Note on honesty vs. licensing: the assistant presents to end users as Solis and
 does not volunteer the underlying base model in chat. The upstream attribution
-(Qwen2.5 etc.) that the license requires lives in MODEL_CARD.md and /health —
+(Qwen3 etc.) that the license requires lives in MODEL_CARD.md and /health —
 that is where disclosure belongs, not forced into every user turn.
 """
 

@@ -1,18 +1,29 @@
-# Solis 1.9 — a branded, fine-tuned build of Qwen2.5 with image + voice analysis.
-# (The legacy from-scratch model in legacy/ used a lighter set; this is the
-# stack the current product needs.)
+# Solis 1.9 — a branded, fine-tuned build of Qwen3 with image + voice analysis.
 
 # Core inference
-torch>=2.2
-transformers>=4.49          # Qwen2.5 + Qwen2.5-VL support
-accelerate>=0.30
-bitsandbytes>=0.43          # 4-bit (nf4) loading so 7B/14B fit a 16 GB card
+torch>=2.4
+transformers>=4.51          # Qwen3 + Qwen3-VL support
+accelerate>=0.34
+bitsandbytes>=0.43          # 4-bit (nf4) loading so 8B/14B fit a 16 GB card
 sentencepiece>=0.2
 
 # Fine-tuning (QLoRA)
-peft>=0.11
-trl>=0.9
+peft>=0.13
+trl>=0.12
 datasets>=2.16
+
+# Unsloth — the default training backend. ~2x faster and ~50% less VRAM than
+# stock PEFT, and it is what makes 14B QLoRA fit a 16 GB card at all. Training
+# falls back to plain PEFT if this is absent (expect OOM on 14B if it is).
+#
+# Linux and Windows are both supported; macOS is not (no CUDA), so on a Mac
+# install everything else and use --backend peft, or train on a Linux/Windows
+# GPU box. On Windows, Unsloth additionally needs Triton — see the note below.
+unsloth>=2025.1 ; sys_platform != "darwin"
+unsloth_zoo ; sys_platform != "darwin"
+# Windows-only: Unsloth's kernels need Triton, which ships as a separate
+# Windows build. WSL2 uses the normal Linux triton and does not need this.
+triton-windows ; sys_platform == "win32"
 
 # Serving API
 fastapi>=0.110
@@ -25,5 +36,6 @@ regex>=2023.0
 
 # Optional — only if you enable extra capabilities:
 # torchaudio                # non-WAV voice input
-# qwen-vl-utils             # richer Qwen2.5-VL image/video preprocessing
+# qwen-vl-utils             # richer Qwen3-VL image/video preprocessing
 # diffusers                 # image GENERATION (currently a deferred hook)
+# flash-attn                # enables --packing in the fine-tuner

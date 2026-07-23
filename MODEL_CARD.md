@@ -6,20 +6,21 @@ model trained from scratch. Each Solis variant is a specific base model served
 
 ## Attribution & licensing
 
-Solis 1.9 is **built on Qwen2.5** (Alibaba Cloud) for its text and vision
+Solis 1.9 is **built on Qwen3** (Alibaba Group) for its text and vision
 variants, **OpenAI Whisper** for voice, and (when enabled) **SDXL** for image
 generation. Rebranding to "Solis" does not remove these upstream obligations —
 they are disclosed here and in `/health` as the licenses require.
 
 | Solis variant | Base model | License |
 | --- | --- | --- |
-| solis-1.9-nano | Qwen/Qwen2.5-1.5B-Instruct | Apache-2.0 |
-| solis-1.9-mini | Qwen/Qwen2.5-3B-Instruct | Qwen License |
-| solis-1.9-small | Qwen/Qwen2.5-7B-Instruct | Apache-2.0 |
-| solis-1.9-base | Qwen/Qwen2.5-14B-Instruct | Apache-2.0 |
-| solis-1.9 (flagship) | Qwen/Qwen2.5-32B-Instruct | Apache-2.0 |
-| solis-1.9-max | Qwen/Qwen2.5-72B-Instruct | Qwen License |
-| solis-1.9-vision(-mini/-max) | Qwen/Qwen2.5-VL-{3B,7B,32B}-Instruct | Qwen License |
+| solis-1.9-nano | Qwen/Qwen3-1.7B | Apache-2.0 |
+| solis-1.9-mini | Qwen/Qwen3-4B | Apache-2.0 |
+| solis-1.9 *(default)* | Qwen/Qwen3-8B | Apache-2.0 |
+| solis-1.9-base | Qwen/Qwen3-14B | Apache-2.0 |
+| solis-1.9-large | Qwen/Qwen3-32B | Apache-2.0 |
+| solis-1.9-max | Qwen/Qwen3.6-27B | Apache-2.0 |
+| solis-1.9-moe | Qwen/Qwen3.6-35B-A3B | Apache-2.0 |
+| solis-1.9-vision(-mini/-max) | Qwen/Qwen3-VL-{4B,8B,32B}-Instruct | Apache-2.0 |
 | solis-1.9-voice(-fast) | openai/whisper-large-v3-turbo / distil-whisper | MIT |
 | solis-1.9-draw *(deferred)* | stabilityai/stable-diffusion-xl-base-1.0 | OpenRAIL++-M |
 
@@ -29,10 +30,11 @@ model card (or equivalent notice) with any distribution.
 
 ## What Solis 1.9 is
 
-- **Text**: a Qwen2.5 instruct model, served with the Solis identity (hardcoded
+- **Text**: a Qwen3 instruct model, served with the Solis identity (hardcoded
   in `solis/identity.py`), and optionally a Solis LoRA adapter
   (`finetune/lora_finetune.py`) that bakes identity and domain behaviour in.
-- **Image analysis**: Qwen2.5-VL answers questions about images.
+  Qwen3's hybrid thinking mode is exposed per request and off by default.
+- **Image analysis**: Qwen3-VL answers questions about images.
 - **Voice analysis**: Whisper transcribes speech; the transcript flows into the
   text model.
 - **Image generation**: a declared capability slot, **not yet wired** (needs
@@ -55,6 +57,11 @@ provided images and audio. Fine-tune with your own data to specialise it.
 ## How it was built
 
 No pretraining. Variants map to published base checkpoints (see the table).
-Optional supervised fine-tuning uses QLoRA (4-bit base + low-rank adapters) on
-datasets normalised by `data/ingest.py`. See the repository README for exact
-commands.
+Optional supervised fine-tuning uses QLoRA (4-bit base + low-rank adapters),
+run through Unsloth where available, on datasets normalised by
+`data/ingest.py`. See the repository README for exact commands.
+
+Sizing note: memory for a Mixture-of-Experts variant is set by **total**
+parameters, not active ones — every expert stays resident. `solis-1.9-moe`
+(Qwen3.6-35B-A3B) activates only 3B per token but still needs ~19-21 GB of
+4-bit weights, so it is a cloud variant despite the small active count.
