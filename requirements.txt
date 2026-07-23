@@ -1,11 +1,29 @@
-# Core. Everything Solis needs to train and serve.
+# Solis 1.9 — a branded, fine-tuned build of Qwen2.5 with image + voice analysis.
+# (The legacy from-scratch model in legacy/ used a lighter set; this is the
+# stack the current product needs.)
+
+# Core inference
 torch>=2.2
-numpy>=1.24
-regex>=2023.0        # BPE pre-tokenisation needs \p{L} character classes
+transformers>=4.49          # Qwen2.5 + Qwen2.5-VL support
+accelerate>=0.30
+bitsandbytes>=0.43          # 4-bit (nf4) loading so 7B/14B fit a 16 GB card
+sentencepiece>=0.2
+
+# Fine-tuning (QLoRA)
+peft>=0.11
+trl>=0.9
+datasets>=2.16
+
+# Serving API
 fastapi>=0.110
 uvicorn[standard]>=0.29
 pydantic>=2.0
 
-# Optional: --adam8bit keeps optimizer states in 8 bits, which is what makes
-# the `small` preset trainable on a 16 GB card. Training works without it.
-bitsandbytes>=0.43
+# Media
+pillow>=10.0                # image decoding for vision
+regex>=2023.0
+
+# Optional — only if you enable extra capabilities:
+# torchaudio                # non-WAV voice input
+# qwen-vl-utils             # richer Qwen2.5-VL image/video preprocessing
+# diffusers                 # image GENERATION (currently a deferred hook)

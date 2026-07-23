@@ -1,264 +1,141 @@
-# Solis ☀️
+# Solis 1.9 ☀️
 
-A **sparse Mixture-of-Experts** language model built entirely from scratch — no
-base model, no pretrained weights, no borrowed vocabulary. Solis learns its own
-tokenizer, its own experts, and its own router, starting from random numbers.
+A branded, **fine-tuned multimodal assistant** built on open foundation models.
+Solis 1.9 loads a strong base model (the Qwen2.5 family), serves it under the
+Solis identity, understands **images** and **voice**, and can be **fine-tuned**
+with your own data via QLoRA. Image generation is a declared, deferred
+capability.
 
-The 1.0 family is designed against one hard constraint: **every preset must
-serve inside 16 GB of VRAM**, weights, KV cache, and activation workspace
-included, while keeping *active* parameters low so decoding stays fast.
+> Solis 1.9 is a rebrand/fine-tune, **not** a from-scratch model. It is built on
+> Qwen2.5 (text + vision), Whisper (voice), and SDXL (image gen, when enabled).
+> See [MODEL_CARD.md](MODEL_CARD.md) for attribution and licensing — required by
+> the upstream licenses. The earlier from-scratch Solis lives in [`legacy/`](legacy/).
+
+The Python package is `solis`; the product version is 1.9.
+
+## The ladder — one brand, many sizes
+
+`python -m solis.registry` prints this; VRAM is the serving estimate.
 
 ```
-preset      total   active    ctx   weights     kv    act    peak   fits 16GB
-------------------------------------------------------------------------------
-mini         335M     123M   2048     0.62G  0.03G  0.07G   1.62G        yes
-small       1.79B     489M   4096     3.33G  0.09G  0.22G   4.55G        yes
-base        4.48B     974M   8192     8.35G  0.22G  0.63G  10.09G        yes
-flagship    6.33B    1.40B   8192    11.80G  0.47G  0.72G  13.88G        yes
+TEXT
+  solis-1.9-nano    Qwen2.5-1.5B-Instruct    1.5B  bf16   ~5 GB    runs anywhere
+  solis-1.9-mini    Qwen2.5-3B-Instruct      3.1B  bf16   ~8 GB    16 GB card
+  solis-1.9-small   Qwen2.5-7B-Instruct      7.6B  nf4    ~7 GB    16 GB card (4-bit)
+  solis-1.9-base    Qwen2.5-14B-Instruct    14.7B  nf4   ~12 GB    16 GB (tight) / cloud
+  solis-1.9         Qwen2.5-32B-Instruct    32.5B  bf16  ~67 GB    cloud (flagship)
+  solis-1.9-max     Qwen2.5-72B-Instruct    72.7B  bf16 ~146 GB    cloud
+VISION   solis-1.9-vision(-mini/-max)  →  Qwen2.5-VL-{3B,7B,32B}
+VOICE    solis-1.9-voice(-fast)        →  Whisper large-v3-turbo / distil
+IMAGE GEN  solis-1.9-draw  →  SDXL   (deferred — capability hook only)
 ```
 
-`python -m solis.config` prints this table; `python bench.py` measures it for
-real and tells you where the estimate is wrong.
-
-## Architecture
-
-Decoder-only transformer (`solis/model.py`):
-
-- **Byte-level BPE tokenizer** (`solis/tokenizer.py`) trained on our own corpus.
-  256 byte tokens are always present as a fallback, so nothing is ever
-  unencodable, and round-tripping is exact for arbitrary bytes.
-- **RMSNorm** pre-normalisation, computed in fp32 regardless of autocast dtype.
-- **Grouped-query attention** — fewer KV heads than query heads, which is what
-  makes the KV cache small enough to serve long context in 16 GB.
-- **QK-norm** — RMSNorm on queries and keys before the dot product. Removes the
-  attention-logit blowup that otherwise makes small models diverge.
-- **Sliding-window attention** on most layers, with every 4th layer left global,
-  so attention cost grows linearly in context but information still travels the
-  full sequence.
-- **Rotary position embeddings**, with a scaling factor for serving beyond the
-  trained context.
-- **Mixture-of-Experts FFN** — one *shared* expert that runs for every token,
-  plus a top-k routed set of specialists. The shared path is what keeps a sparse
-  model coherent at small scale: general-purpose computation lives there instead
-  of being relearned by every expert.
-- **Aux-loss-free load balancing** — a per-expert bias steers routing toward
-  under-used experts without adding gradient noise, backed by a small classic
-  auxiliary loss and a router z-loss.
-- The first layers stay **dense**; early layers do broad low-level work that
-  every token needs, so routing them wastes capacity.
-- Weight-tied embedding / LM head, and residual branches scaled by `1/sqrt(2L)`
-  at init so the residual stream does not grow with depth.
-
-### Two implementation details that are easy to get wrong
-
-**MoE dispatch runs as three batched matmuls**, not a Python loop over experts.
-Tokens are sorted by expert and packed into a fixed `(n_experts, capacity, dim)`
-buffer. The naive version — slicing the token stream per expert and looping —
-issues `3 x n_experts` small GEMMs per layer *and* needs a host synchronisation
-to learn the slice boundaries.
-
-**Capacity limiting is training-only.** During training a fixed capacity keeps
-every tensor shape static; overflow pairs are routed to a scratch row whose
-output is zeroed, so they contribute nothing. At inference capacity is the
-largest actual group, which costs one device-to-host read per layer but
-guarantees a token's output never depends on which other tokens shared its
-batch. Without that split, a prefill disagrees with the same tokens decoded one
-at a time — `tests/test_model.py` checks exactly this.
-<<<<<<< HEAD
+The default served model is `solis-1.9-small` (Qwen2.5-7B in 4-bit) — it fits a
+16 GB card in ~5–7 GB and is a genuinely capable assistant.
 
 ## Quickstart
 
 ```bash
-python -m venv .venv && .venv/Scripts/activate   # Linux/macOS: source .venv/bin/activate
 pip install -r requirements.txt
 
-# 1. get a corpus — real-world data (recommended) OR the procedural fallback
-python data/ingest.py --hf <dataset-id> --out data/corpus.jsonl
-#   ...or: python data/build_corpus.py
-
-python data/train_tokenizer.py   # 2. learn the BPE vocabulary
-python data/prepare.py           # 3. tokenise + pack to .bin
-python train.py                  # 4. train  -> checkpoints/solis-mini.pt
-
-python eval.py                   # task accuracy + validation perplexity
-python bench.py                  # real VRAM and throughput
-uvicorn serve:app --port 8000    # serve
+# serve (loads Qwen2.5-7B in 4-bit as Solis; ~5 GB VRAM)
+python serve.py
 ```
 
-Run the tests with `python tests/test_model.py` and
-`python tests/test_multimodal.py`.
-
-## Training on real-world data
-
-`data/ingest.py` converts existing datasets into the corpus format the rest of
-the pipeline reads, so training is not limited to the built-in procedural text.
-It normalises the common chat schemas — `messages`, split
-`system`/`user`/`assistant` columns, ShareGPT `conversations`,
-`prompt`/`response` pairs, and raw `text` — from Hugging Face datasets or local
-JSONL / text files, and writes a train/val split.
+Serves at **http://localhost:8000** — chat on `POST /v1/chat/completions`
+(OpenAI-compatible; base URL `http://localhost:8000/v1`).
 
 ```bash
-python data/ingest.py \
-    --hf oyildirim/cyberstrike-sft-120k \
-    --hf SkywardNomad92/pentest-findings-v2 \
-    --out data/corpus.jsonl
-python data/train_tokenizer.py && python data/prepare.py
-python train.py --preset mini
+curl http://localhost:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":"Who are you?"}]}'
 ```
 
-`train.py` uses fp32 master weights with bf16 autocast, gradient accumulation,
-gradient checkpointing (on by default — a top-k MoE stores `k` copies of every
-intermediate, so recomputation is worth much more here than in a dense model),
-cosine decay after warmup, and no weight decay on norms or embeddings. The
-micro-batch is chosen automatically from free VRAM, and an OOM anywhere in the
-step halves it and retries rather than losing the run.
+Pick a different variant with `SOLIS_MODEL`:
 
 ```bash
-python train.py --preset mini --max-minutes 90
-python train.py --resume
-python train.py --preset small --adam8bit    # 8-bit optimizer states
+SOLIS_MODEL=solis-1.9-mini python serve.py   # 3B, bf16, lighter
+SOLIS_MODEL=solis-1.9-nano python serve.py    # 1.5B, even CPU-ok
 ```
 
-`mini` and `small` train on a single 16 GB card. `base` and `flagship` are
-inference-only at that size — training them needs roughly 55 GB and 77 GB of
-optimizer state respectively, which is a multi-GPU or offloaded job.
+## Image and voice
 
-## Image and voice input
-
-Solis accepts pictures and audio clips alongside text. Each media item is run
-through a small from-scratch encoder — a ViT for images, a log-mel + conv +
-transformer stack for audio (`solis/multimodal.py`) — projected to the model's
-width, and spliced into the token stream in place of an `<|image|>` or
-`<|audio|>` placeholder. From the transformer's side they are just more
-positions, so attention, the KV cache and streaming generation are unchanged.
-
-The server speaks the OpenAI multimodal content-parts format:
+Send OpenAI-style content parts; the server routes images to Qwen2.5-VL and
+audio to Whisper, folds their readings into the conversation, and the text model
+answers. The vision/voice models load lazily on first use (they download once).
 
 ```jsonc
 { "messages": [{ "role": "user", "content": [
-    { "type": "text", "text": "what is in this picture?" },
+    { "type": "text", "text": "What's in this picture?" },
     { "type": "image_url", "image_url": { "url": "data:image/png;base64,..." } },
     { "type": "input_audio", "input_audio": { "data": "<base64 wav>", "format": "wav" } }
 ]}]}
 ```
 
-Enable the encoders with `SOLIS_ENABLE_VISION=1` / `SOLIS_ENABLE_AUDIO=1`, or by
-loading a checkpoint that carries trained encoders. WAV audio is decoded with no
-extra dependencies; other formats need a torchaudio backend.
+`GET /health` reports which capabilities are loaded and the Qwen attribution.
+`GET /v1/models` lists the Solis 1.9 variants.
 
-> **The encoders ship untrained.** The full path works end to end — you can post
-> an image or a clip today — but until the encoders and their projectors are
-> trained on paired data the model *accepts* media without *understanding* it.
-> `/health` reports `modalities.encoders_trained: false` so this is never
-> ambiguous. Training them is a separate job from `train.py`, which optimises
-> the language model only.
+Environment: `SOLIS_MODEL`, `SOLIS_ADAPTER` (a Solis LoRA), `SOLIS_4BIT`,
+`SOLIS_VISION`, `SOLIS_VOICE`, `SOLIS_LOAD_VISION/VOICE=1` (preload), `PORT`.
 
-## The corpus
+## Fine-tuning — make it *your* Solis
 
-There are two ways to feed Solis, and they trade off provenance against
-capability:
-
-**Real-world data (`data/ingest.py`)** is the recommended path and what the
-model is intended to train on. It pulls existing datasets — Hugging Face,
-local JSONL, or plain text — normalises their schema, and produces the packed
-corpus. This is where broad vocabulary and real knowledge come from; BPE no
-longer saturates early because the text has genuine lexical diversity.
-
-**The procedural generator (`data/build_corpus.py`)** writes everything from
-templates — nothing scraped, nothing copyrighted. It is ideal for standing the
-pipeline up and for teaching **in-context work** (answer from the given passage,
-transform this text, follow this format), but a model trained only on it has
-bounded vocabulary (~5k unique pre-tokens) and no world knowledge. Use it as a
-fallback or to supplement real data with clean task-format examples.
-
-Either way the output is `data/corpus.jsonl` + `data/corpus.val.jsonl`, and
-`data/prepare.py` consumes any JSONL with a `messages` field.
-
-## Serving API
-
-`POST /v1/chat` — streams **Server-Sent Events**:
-
-```jsonc
-// request
-{ "messages": [{ "role": "user", "content": "who are you?" }],
-  "max_tokens": 256, "temperature": 0.8 }
-
-// stream
-data: {"type":"token","text":"I"}
-data: {"type":"token","text":" am"}
-...
-data: {"type":"done","usage":{...},"timing":{"tokens_per_second":42.1}}
-```
-
-`POST /v1/chat/completions` — OpenAI-compatible, streaming or not, so existing
-clients work unchanged.
-
-`GET /health` — device, dtype, parameter counts, live VRAM.
-
-Streaming is byte-aware: a BPE token can end mid-UTF-8-character, so partial
-bytes are held back until they form a complete character.
-
-Environment: `SOLIS_CKPT`, `SOLIS_TOKENIZER`, `SOLIS_DEVICE`, `SOLIS_DTYPE`,
-`SOLIS_MAX_TOKENS`, `SOLIS_CORS_ORIGINS`, `PORT`.
-
-## Tool calling (MCP)
-
-Solis can reach out to external tools over the **Model Context Protocol** — a
-filesystem browser, a database, a web fetcher, anything that speaks MCP — and
-fold their results back into the conversation. It is pure serving-side plumbing
-(`solis/mcp.py`); nothing about the model changes, and the language model is not
-retrained. The loop is simply:
-
-```
-render tools -> model asks for a call -> we run it over MCP -> feed result back
-```
-
-Point `SOLIS_MCP_CONFIG` at a JSON file using the same `mcpServers` shape the
-other MCP clients use — an existing config drops straight in:
-
-```jsonc
-{
-  "mcpServers": {
-    "fs":   { "command": "npx",
-              "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"] },
-    "docs": { "url": "https://example.com/mcp",
-              "headers": { "Authorization": "Bearer ..." } }
-  }
-}
-```
+QLoRA trains low-rank adapters on a frozen 4-bit base, so a 7B fine-tunes on a
+16 GB card. Data can be any Hugging Face dataset or local JSONL — rows are
+normalised by `data/ingest.py` (messages / conversations / prompt-response /
+question-answer / raw text) and rendered with the base chat template. The Solis
+identity is trained in by default.
 
 ```bash
-SOLIS_MCP_CONFIG=mcp.example.json uvicorn serve:app --port 8000
+python finetune/lora_finetune.py \
+    --model solis-1.9-small \
+    --hf teknium/OpenHermes-2.5 --max-samples 20000 \
+    --output checkpoints/solis-small-lora
+
+# serve the fine-tune
+SOLIS_MODEL=solis-1.9-small SOLIS_ADAPTER=checkpoints/solis-small-lora python serve.py
 ```
 
-Both **stdio** (subprocess) and **streamable-HTTP** servers are supported, with
-the standard library only — no new dependencies. Tools are namespaced
-`<server>__<tool>` so two servers can expose the same tool name. A from-scratch
-model has not memorised any provider's function-calling grammar, so the server
-teaches it a dead-simple one in the system prompt:
+To fine-tune the largest model that fits a 16 GB card on a streamed mix of
+massive datasets (with automatic 14B→7B fallback), use the launcher:
 
-```
-<tool_call>{"name": "fs__read_file", "arguments": {"path": "/tmp/x"}}</tool_call>
+```bash
+nohup bash finetune/train_local.sh > logs/finetune.log 2>&1 &
+tail -f logs/finetune.log
 ```
 
-The chat endpoints execute any calls the model emits and continue until it
-answers in plain text (bounded by `SOLIS_MCP_MAX_ROUNDS`, default 5). `/v1/chat`
-also emits `tool_call` / `tool_result` SSE events so a client can show progress.
-Set `"use_tools": false` on a request to force a plain answer.
+The adapter is tens of MB. On a big GPU, drop `--model` to a larger variant and
+add flash-attention + `--packing` for speed.
 
-- `GET  /v1/mcp/tools` — the tools every connected server exposes (OpenAI shape)
-- `POST /v1/mcp/call`  — invoke one tool directly, e.g. to check a server wiring
-- `GET  /health` — reports per-server MCP status alongside the model info
+## Image generation (deferred)
 
-Config errors disable tools with a warning instead of crashing the server, and
-one server failing to start never takes the others (or the endpoint) down.
+`solis/imagegen.py` defines the capability and the registry reserves
+`solis-1.9-draw` (SDXL), but no diffusion model is wired yet — `/health` reports
+`image_generation.wired: false`. Enabling it means `pip install diffusers` and
+implementing `ImageGenerator.load()`; the interface is ready.
 
-## Website data
+## Layout
 
-The companion site lives on a separate machine, not in this repo. The numbers
-it needs come from the measurement scripts here: `python eval.py` writes
-`results/eval.json` (task accuracy, validation perplexity) and `python bench.py`
-writes `results/bench.json` (real VRAM and throughput per preset). Every Solis
-number in those files is measured on the machine that produced it.
-=======
->>>>>>> 0bc936d61329966639da9dc8f967c059ea2f1d3c
+```
+solis/             the Solis 1.9 package
+  registry.py      the variant ladder (Solis name -> base model)
+  identity.py      Solis branding / system prompt (hardcoded identity)
+  engine.py        Qwen2.5 text engine (4-bit, LoRA, streaming)
+  vision.py        Qwen2.5-VL image analysis
+  voice.py         Whisper speech-to-text
+  imagegen.py      image-generation hook (deferred)
+serve.py           OpenAI-compatible multimodal server
+finetune/          QLoRA fine-tuning -> Solis adapters
+  lora_finetune.py    the fine-tuner
+  train_local.sh      largest-that-fits launcher (streamed massive data)
+data/ingest.py     dataset normaliser (shared)
+deploy/            RunPod scripts (from the earlier from-scratch training)
+legacy/            the archived from-scratch Solis (v1.0–1.6)
+MODEL_CARD.md      attribution, licensing, limitations
+```
+
+## Attribution
+
+Solis 1.9 is built on Qwen2.5 (Alibaba Cloud), OpenAI Whisper, and — when
+enabled — SDXL. Keep [MODEL_CARD.md](MODEL_CARD.md) with any distribution; the
+upstream licenses require the attribution it contains.
